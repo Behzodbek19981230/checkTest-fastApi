@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from functools import wraps
 import base64
 import cv2
@@ -28,7 +29,9 @@ def requires_auth(f):
         return f(*args, **kwargs)
     return decorated
 
+
 app = Flask(__name__)
+CORS(app)
 
 
 
