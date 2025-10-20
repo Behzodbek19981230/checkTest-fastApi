@@ -17,32 +17,31 @@ def generate_omr_sheet(sheet_path, num_questions=108, num_variants=4, sheet_id="
     img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(img)
 
-    # Sheet ID va nomer
+    # Sheet ID faqat bitta kichik joyda
     draw.text((margin, 50), f"Javoblar varaqi", font=font, fill="black")
-    draw.text((margin, 120), f"Varaqa ID: {sheet_id}", font=small_font, fill="black")
 
-    # 3 ta ustunli joylashuv
+    # Katta joylashuv: savollar va variantlar A4 ni to'ldiradi
     num_columns = 3
     questions_per_col = num_questions // num_columns
     col_width = (width - 2 * margin) // num_columns
+    big_cell_size = 60
+    big_gap_x = 32
+    big_gap_y = 32
+    big_font = ImageFont.truetype(font_path, 48)
+    big_small_font = ImageFont.truetype(font_path, 38)
     for col in range(num_columns):
         for row in range(questions_per_col):
             i = col * questions_per_col + row
-            y = start_y + row * (cell_size + gap_y)
+            y = start_y + row * (big_cell_size + big_gap_y)
             x_base = start_x + col * col_width
-            draw.text((x_base, y), f"{i+1:03}", font=small_font, fill="black")
+            draw.text((x_base, y), f"{i+1:03}", font=big_small_font, fill="black")
             for v in range(num_variants):
-                x = x_base + 80 + v * (cell_size + gap_x)
-                # Doira (variant)
-                draw.ellipse((x, y, x+cell_size, y+cell_size), outline="black", width=2)
-                draw.text((x+cell_size//2-10, y+cell_size//2-18), chr(65+v), font=small_font, fill="black")
+                x = x_base + 120 + v * (big_cell_size + big_gap_x)
+                # Katta doira (variant)
+                draw.ellipse((x, y, x+big_cell_size, y+big_cell_size), outline="black", width=4)
+                draw.text((x+big_cell_size//2-14, y+big_cell_size//2-24), chr(65+v), font=big_small_font, fill="black")
 
-    # Pastki qismga ism va familiya uchun faqat tekstli joy
-    name_y = height - 250
-    label_font = ImageFont.truetype(font_path, 32)
-    draw.text((margin, name_y), "Ism: ______________________________________", font=label_font, fill="black")
-    surname_y = name_y + 60
-    draw.text((margin, surname_y), "Familiya: __________________________________", font=label_font, fill="black")
+    # Ism, familiya, variant ID grid yo'q
 
     # Saqlash
     img.save(sheet_path)

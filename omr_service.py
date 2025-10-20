@@ -20,51 +20,60 @@ def analyze_omr_sheet(image_path):
     # Konturlarni topish
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Mapping uchun parametrlar (generate_omr_sheet.py bilan mos)
+    # Mapping uchun parametrlar (generate_omr_sheet.py bilan mos, 4 qator, katta doira)
     num_questions = 108
     num_variants = 4
-    num_columns = 3
+    num_columns = 4
     questions_per_col = num_questions // num_columns
     width, height = 2480, 3508
     margin = 100
-    cell_size = 40
-    gap_x = 20
-    gap_y = 20
+    big_cell_size = 60
+    big_gap_x = 32
+    big_gap_y = 32
     start_y = 250
     start_x = margin
     col_width = (width - 2 * margin) // num_columns
     variant_labels = ['A', 'B', 'C', 'D']
 
-    # Faqat bo'yalgan variantlarni aniqlash
+    # Faqat bo'yalgan variantlarni aniqlash (yangi layout, 4 qator, katta doira)
     marked = dict()
     for col in range(num_columns):
         x_base = start_x + col * col_width
         for row in range(questions_per_col):
-            y = start_y + row * (cell_size + gap_y)
+            y = start_y + row * (big_cell_size + big_gap_y)
             qnum = col * questions_per_col + row + 1
-            found = False
             for v in range(num_variants):
-                vx = x_base + 80 + v * (cell_size + gap_x)
+                vx = x_base + 120 + v * (big_cell_size + big_gap_x)
                 vy = y
-                # Doira ichidan kichikroq ROI ajratamiz
-                roi = thresh[vy+5:vy+cell_size-5, vx+5:vx+cell_size-5]
+                roi = thresh[vy+8:vy+big_cell_size-8, vx+8:vx+big_cell_size-8]
                 total = roi.size
                 black = np.count_nonzero(roi)
                 fill_ratio = black / total
-                # 0.6 dan katta bo'lsa, bo'yalgan deb hisoblaymiz
-                if fill_ratio > 0.6:
+                if fill_ratio > 0.5:
                     marked[str(qnum)] = variant_labels[v]
-                    found = True
-            # Agar hech biri bo'yalanmagan bo'lsa, natijaga qo'shilmaydi (null qaytmaydi, shunchaki yo'q)
 
-    # Variant ID joyini aniqlash (masalan, yuqoridagi maxsus joy)
-    # Bu joyni rasm formatiga moslab o'zgartiring
-    # OCR uchun joyni kengaytirish va faqat raqamlarni ajratish
-    variant_roi = img[100:180, 100:700]  # "Varaqa ID" yozuvi joylashgan joy
-    ocr_text = pytesseract.image_to_string(variant_roi, config='--psm 7').strip()
-    import re
-    match = re.search(r'(\d{6,})', ocr_text)
-    variant_id = match.group(1) if match else ''
+    # Variant ID: 10x10 grid (pastki qismda, har bir qatorda 0-9 dan bittasi bo'yalgan)
+    grid_top_y = height - 500
+    grid_left_x = margin
+    grid_cell_size = 38
+    grid_gap = 12
+    variant_digits = []
+    for row in range(10):
+        y = grid_top_y + row * (grid_cell_size + grid_gap)
+        found_digit = None
+        for col in range(10):
+            x = grid_left_x + col * (grid_cell_size + grid_gap)
+            roi = thresh[y+6:y+grid_cell_size-6, x+6:x+grid_cell_size-6]
+            total = roi.size
+            black = np.count_nonzero(roi)
+            fill_ratio = black / total
+            if fill_ratio > 0.5:
+                found_digit = str(col)
+        if found_digit is not None:
+            variant_digits.append(found_digit)
+        else:
+            variant_digits.append('_')  # Agar bo'yalmagan bo'lsa, aniqlanmagan
+    variant_id = ''.join(variant_digits)
 
     return {'variant_id': variant_id, 'answers': marked}
 
