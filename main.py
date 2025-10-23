@@ -30,8 +30,14 @@ def requires_auth(f):
     return decorated
 
 
+
 app = Flask(__name__)
 CORS(app)
+
+# Default page for runner message
+@app.route('/')
+def home():
+    return '<h2>OMR API Runner: Server is running and ready to accept requests.</h2>'
 
 
 
