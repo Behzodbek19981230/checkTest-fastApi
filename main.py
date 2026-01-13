@@ -1,6 +1,10 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, g
 from flask_cors import CORS
 from functools import wraps
+import logging
+import os
+import traceback
+import uuid
 import base64
 import cv2
 import numpy as np
@@ -34,6 +38,34 @@ def requires_auth(f):
 
 app = Flask(__name__)
 CORS(app)
+
+# Ensure Uzbek text is returned correctly
+app.config['JSON_AS_ASCII'] = False
+
+# Basic structured logging
+logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO').upper())
+
+
+@app.before_request
+def _assign_request_id():
+    g.request_id = request.headers.get('X-Request-Id') or str(uuid.uuid4())
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected_error(e):
+    """Return JSON on unhandled errors (prevents default HTML 500 pages)."""
+    request_id = getattr(g, 'request_id', None) or str(uuid.uuid4())
+    app.logger.exception('Unhandled error (requestId=%s)', request_id)
+    payload = {
+        'message': 'Internal Server Error',
+        'requestId': request_id,
+        'error': str(e),
+        'errorType': type(e).__name__,
+    }
+    # Only include traceback when explicitly enabled (avoid leaking internals by default)
+    if str(os.getenv('DEBUG_ERRORS', '')).strip().lower() in {'1', 'true', 'yes', 'on'}:
+        payload['traceback'] = traceback.format_exc()
+    return jsonify(payload), 500
 
 PARSER_VERSION = '2026-01-12-img-dedupe'
 
@@ -77,9 +109,10 @@ def import_questions():
     Expects multipart/form-data with a `file` field.
     Returns: { questions: [{question, options, correctAnswer, points}], errors: [..] }
     """
+    request_id = getattr(g, 'request_id', None) or str(uuid.uuid4())
     f = request.files.get('file')
     if not f:
-        return jsonify({'message': 'No file uploaded (field name must be "file")'}), 400
+        return jsonify({'message': 'No file uploaded (field name must be "file")', 'requestId': request_id}), 400
 
     filename = (f.filename or '').lower()
     content = f.read()
@@ -90,22 +123,27 @@ def import_questions():
         elif filename.endswith('.xlsx') or filename.endswith('.xlsm') or filename.endswith('.xltx') or filename.endswith('.xltm'):
             parsed, errors = parse_xlsx_questions(content)
         else:
-            return jsonify({'message': 'Unsupported file type. Upload .docx or .xlsx'}), 415
+            return jsonify({'message': 'Unsupported file type. Upload .docx or .xlsx', 'requestId': request_id}), 415
     except Exception as e:
-        return jsonify({'message': 'Failed to parse file', 'error': str(e)}), 500
-    print(f'Parsed {len(parsed)} questions with {len(errors)} errors from {filename}')
+        app.logger.exception('Failed to parse import file (requestId=%s, filename=%s)', request_id, filename)
+        return jsonify({'message': 'Failed to parse file', 'error': str(e), 'requestId': request_id}), 500
+
+    # Be defensive about JSON serialization.
+    questions_out = []
+    for q in parsed:
+        questions_out.append({
+            'question': str(q.question),
+            'options': [str(o) for o in (q.options or [])],
+            'correctAnswer': int(q.correct_answer_index),
+            'points': int(q.points),
+        })
+
+    app.logger.info('Import parsed %s questions (%s errors) requestId=%s file=%s', len(parsed), len(errors), request_id, filename)
 
     return jsonify({
         'parserVersion': PARSER_VERSION,
-        'questions': [
-            {
-                'question': q.question,
-                'options': q.options,
-                'correctAnswer': q.correct_answer_index,
-                'points': q.points,
-            }
-            for q in parsed
-        ],
+        'requestId': request_id,
+        'questions': questions_out,
         'errors': errors,
     })
 
