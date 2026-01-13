@@ -1,13 +1,13 @@
 import cv2
 import numpy as np
-import pytesseract
-import os
 
-def analyze_omr_sheet(image_path):
+
+def analyze_omr_sheet(image_path, code_digits: int = 5):
     """
     OMR-style javob varaqasini tahlil qiladi.
     :param image_path: Rasm (jpg/png) fayl yo'li
-    :return: {'variant_id': str, 'answers': [int, ...]}
+    :param code_digits: Test ID uzunligi (default: 5)
+    :return: {'variant_id': str, 'answers': {qnum: 'A'|'B'|'C'|'D'}}
     """
     # Rasmni yuklash
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -20,17 +20,18 @@ def analyze_omr_sheet(image_path):
     # Konturlarni topish
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Mapping uchun parametrlar (generate_omr_sheet.py bilan mos, 4 qator, katta doira)
+    # Mapping uchun parametrlar (generate_omr_sheet.py bilan mos)
     num_questions = 108
     num_variants = 4
     num_columns = 4
-    questions_per_col = num_questions // num_columns
+    rows_per_col = int(np.ceil(num_questions / num_columns))
     width, height = 2480, 3508
-    margin = 100
-    big_cell_size = 60
-    big_gap_x = 32
-    big_gap_y = 32
-    start_y = 250
+    margin = 80
+    bubble_size = 54
+    gap_x = 22
+    gap_y = 18
+    # Must match generate_omr_sheet.py (moved down for header/info fields)
+    start_y = 380
     start_x = margin
     col_width = (width - 2 * margin) // num_columns
     variant_labels = ['A', 'B', 'C', 'D']
@@ -39,31 +40,34 @@ def analyze_omr_sheet(image_path):
     marked = dict()
     for col in range(num_columns):
         x_base = start_x + col * col_width
-        for row in range(questions_per_col):
-            y = start_y + row * (big_cell_size + big_gap_y)
-            qnum = col * questions_per_col + row + 1
+        for row in range(rows_per_col):
+            y = start_y + row * (bubble_size + gap_y)
+            qnum = col * rows_per_col + row + 1
+            if qnum > num_questions:
+                continue
             for v in range(num_variants):
-                vx = x_base + 120 + v * (big_cell_size + big_gap_x)
+                vx = x_base + 90 + v * (bubble_size + gap_x)
                 vy = y
-                roi = thresh[vy+8:vy+big_cell_size-8, vx+8:vx+big_cell_size-8]
+                roi = thresh[vy+8:vy+bubble_size-8, vx+8:vx+bubble_size-8]
                 total = roi.size
                 black = np.count_nonzero(roi)
                 fill_ratio = black / total
                 if fill_ratio > 0.5:
                     marked[str(qnum)] = variant_labels[v]
 
-    # Variant ID: 10x10 grid (pastki qismda, har bir qatorda 0-9 dan bittasi bo'yalgan)
-    grid_top_y = height - 500
+    # Test ID: code_digits x 10 grid (pastki qismda, har bir qatorda 0-9 dan bittasi bo'yalgan)
     grid_left_x = margin
-    grid_cell_size = 38
+    grid_top_y = height - 760
+    # Must match generate_omr_sheet.py (same as bubble_size)
+    grid_cell_size = bubble_size
     grid_gap = 12
     variant_digits = []
-    for row in range(10):
+    for row in range(int(code_digits)):
         y = grid_top_y + row * (grid_cell_size + grid_gap)
         found_digit = None
         for col in range(10):
             x = grid_left_x + col * (grid_cell_size + grid_gap)
-            roi = thresh[y+6:y+grid_cell_size-6, x+6:x+grid_cell_size-6]
+            roi = thresh[y+8:y+grid_cell_size-8, x+8:x+grid_cell_size-8]
             total = roi.size
             black = np.count_nonzero(roi)
             fill_ratio = black / total

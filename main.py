@@ -87,6 +87,7 @@ def version():
 def analyze():
     data = request.json
     img_b64 = data.get('image')
+    code_digits = data.get('codeDigits', 5) if isinstance(data, dict) else 5
     if not img_b64:
         return jsonify({'error': 'No image provided'}), 400
     # Base64 dan faylga yozish
@@ -98,7 +99,12 @@ def analyze():
         tmp.write(img_bytes)
         tmp_path = tmp.name
     # OMR tahlil qilish (fayl yo'li orqali)
-    result = analyze_omr_sheet(tmp_path)
+    try:
+        code_digits_int = int(code_digits)
+    except Exception:
+        return jsonify({'error': 'codeDigits must be an integer'}), 400
+
+    result = analyze_omr_sheet(tmp_path, code_digits=code_digits_int)
     return jsonify(result)
 
 
