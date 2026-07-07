@@ -10,9 +10,11 @@ import cv2
 import numpy as np
 from PIL import Image
 import tempfile
+import threading
 import generate_omr_sheet
 from omr_service import analyze_omr_sheet
-from import_service import parse_docx_questions, parse_xlsx_questions
+from import_service import parse_docx_questions, parse_xlsx_questions, parse_docx_word_questions
+from job_store import create_job, set_job_result, set_job_error, get_job
 USERNAME = 'admin'
 PASSWORD = 'secret123'
 
@@ -154,7 +156,73 @@ def import_questions():
     })
 
 
+def _run_word_questions_job(job_id, content, filename, request_id):
+    try:
+        questions, errors = parse_docx_word_questions(content)
+    except Exception as e:
+        app.logger.exception(
+            'Word-questions job failed (jobId=%s, requestId=%s, filename=%s)',
+            job_id, request_id, filename,
+        )
+        set_job_error(job_id, str(e))
+        return
+
+    app.logger.info(
+        'Word-questions job done: %s questions (%s errors) jobId=%s requestId=%s file=%s',
+        len(questions), len(errors), job_id, request_id, filename,
+    )
+    set_job_result(job_id, {
+        'parserVersion': PARSER_VERSION,
+        'requestId': request_id,
+        'questions': questions,
+        'errors': errors,
+    })
+
+
+@app.route('/import/word-questions', methods=['POST'])
+def import_word_questions():
+    """Starts a background job to import questions from a DOCX using the
+    plain-text '#'/'A)'/'+C)' convention (parsing - especially embedded
+    ChemDraw/EMF/WMF images - can take long enough on large files to blow past
+    HTTP/proxy timeouts, so this returns a job id immediately instead of the
+    parsed result).
+
+    Expects multipart/form-data with a `file` field.
+    Returns: { jobId, status: 'pending' }. Poll GET /import/word-questions/<jobId>.
+    """
+    request_id = getattr(g, 'request_id', None) or str(uuid.uuid4())
+    f = request.files.get('file')
+    if not f:
+        return jsonify({'message': 'No file uploaded (field name must be "file")', 'requestId': request_id}), 400
+
+    filename = (f.filename or '').lower()
+    if not filename.endswith('.docx'):
+        return jsonify({'message': "Faqat .docx fayllar qo'llab-quvvatlanadi", 'requestId': request_id}), 415
+
+    content = f.read()
+    job_id = create_job()
+    threading.Thread(
+        target=_run_word_questions_job,
+        args=(job_id, content, filename, request_id),
+        daemon=True,
+    ).start()
+
+    app.logger.info('Word-questions job started jobId=%s requestId=%s file=%s', job_id, request_id, filename)
+    return jsonify({'jobId': job_id, 'status': 'pending', 'requestId': request_id}), 202
+
+
+@app.route('/import/word-questions/<job_id>', methods=['GET'])
+def get_word_questions_job(job_id):
+    """Polled by the client every few seconds to check job progress."""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'status': 'error', 'message': "Job topilmadi yoki muddati tugagan"}), 404
+    if job['status'] == 'pending':
+        return jsonify({'status': 'pending'})
+    if job['status'] == 'error':
+        return jsonify({'status': 'error', 'message': job['error'] or 'Import xatoligi'}), 500
+    return jsonify({'status': 'done', **job['result']})
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, threaded=True)

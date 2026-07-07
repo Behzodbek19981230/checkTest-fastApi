@@ -8,3 +8,8 @@ defusedxml
 lxml
 mammoth
 openpyxl
+
+# System dependency (not pip-installable): the `soffice`/`libreoffice` binary
+# must be on PATH for import_service.py to convert embedded EMF/WMF images
+# (Word Equation Editor objects, pasted vector art) to inline SVG. Without it,
+# those images are still imported but as a non-renderable data: URI fallback.

@@ -4,12 +4,17 @@ import zipfile
 import base64
 import mimetypes
 import os
+import shutil
+import subprocess
+import tempfile
+import uuid
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 from defusedxml.lxml import fromstring
 from lxml import etree
 from openpyxl import load_workbook
+from PIL import Image, ImageChops
 
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -45,6 +50,271 @@ def _escape_html(text: str) -> str:
 
 def _strip_tags(html: str) -> str:
 	return re.sub(r"<[^>]+>", " ", str(html or "")).strip()
+
+
+_SOFFICE_BIN = shutil.which("soffice") or shutil.which("libreoffice")
+
+_RASTER_EXT_MIME = {
+	"png": "image/png",
+	"jpg": "image/jpeg",
+	"jpeg": "image/jpeg",
+	"gif": "image/gif",
+	"bmp": "image/bmp",
+	"tif": "image/tiff",
+	"tiff": "image/tiff",
+	"svg": "image/svg+xml",
+}
+
+# Word's legacy Equation Editor / pasted vector art (ChemDraw, shapes, etc.) is
+# often embedded as EMF/WMF. Browsers cannot render either format directly, so
+# a raw base64 data: URI just shows a broken image. LibreOffice (if installed
+# on the host) can convert these to SVG, which every browser renders natively.
+_VECTOR_EXT = {"emf", "wmf"}
+
+
+def _autocrop_bbox(png_bytes: bytes, pad_frac: float = 0.04) -> Optional[Tuple[Tuple[int, int, int, int], Tuple[int, int]]]:
+	"""Finds the pixel bounding box of non-white content in a page render, padded
+	slightly, plus the full page's pixel size: ((x0, y0, x1, y1), (page_w, page_h)).
+	None if detection fails or the page is blank (nothing to crop to)."""
+	try:
+		im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+	except Exception:
+		return None
+	w, h = im.size
+	if w <= 0 or h <= 0:
+		return None
+	bg = Image.new("RGB", im.size, (255, 255, 255))
+	bbox = ImageChops.difference(im, bg).getbbox()
+	if not bbox:
+		return None
+	x0, y0, x1, y1 = bbox
+	pad_x, pad_y = (x1 - x0) * pad_frac, (y1 - y0) * pad_frac
+	x0, y0 = max(0, x0 - pad_x), max(0, y0 - pad_y)
+	x1, y1 = min(w, x1 + pad_x), min(h, y1 + pad_y)
+	if x1 <= x0 or y1 <= y0:
+		return None
+	return (round(x0), round(y0), round(x1), round(y1)), (w, h)
+
+
+def _crop_svg_viewbox(svg_bytes: bytes, frac_bbox: Tuple[float, float, float, float]) -> bytes:
+	"""Narrows an SVG's viewBox to the given fractional sub-rectangle, without touching
+	any path data - this crops out surrounding whitespace while staying fully vector."""
+	try:
+		text = svg_bytes.decode("utf-8")
+	except Exception:
+		return svg_bytes
+	m = re.search(r'viewBox="([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)"', text)
+	if not m:
+		return svg_bytes
+	vx, vy, vw, vh = (float(g) for g in m.groups())
+	fx0, fy0, fx1, fy1 = frac_bbox
+	new_x, new_y = vx + fx0 * vw, vy + fy0 * vh
+	new_w, new_h = (fx1 - fx0) * vw, (fy1 - fy0) * vh
+	if new_w <= 0 or new_h <= 0:
+		return svg_bytes
+	text = re.sub(
+		r'viewBox="[^"]*"',
+		f'viewBox="{new_x:.2f} {new_y:.2f} {new_w:.2f} {new_h:.2f}"',
+		text,
+		count=1,
+	)
+	# Drop the root <svg>'s physical width/height (e.g. "210mm"/"297mm" for the
+	# original full page) - they no longer match the narrowed viewBox, and the
+	# <img> tag we wrap this in already sets the final on-page size explicitly.
+	text = re.sub(r'(<svg\b[^>]*?)\swidth="[^"]*"', r"\1", text, count=1)
+	text = re.sub(r'(<svg\b[^>]*?)\sheight="[^"]*"', r"\1", text, count=1)
+	return text.encode("utf-8")
+
+
+def _convert_vector_image_to_svg(
+	img_bytes: bytes, ext: str
+) -> Tuple[Optional[bytes], Optional[Tuple[int, int]]]:
+	"""Returns (svg_bytes, natural_size_px). natural_size_px is the drawing's own
+	intrinsic pixel size (detected from its cropped bounding box), used as a
+	sizing fallback when Word doesn't declare a placement size for it."""
+	if not _SOFFICE_BIN:
+		return None, None
+	with tempfile.TemporaryDirectory(prefix="docximg_") as td:
+		src_path = os.path.join(td, f"image.{ext}")
+		with open(src_path, "wb") as fh:
+			fh.write(img_bytes)
+		profile_dir = os.path.join(td, f"lo_profile_{uuid.uuid4().hex}")
+
+		def _convert(target_fmt: str) -> Optional[bytes]:
+			try:
+				subprocess.run(
+					[
+						_SOFFICE_BIN,
+						f"-env:UserInstallation=file://{profile_dir}",
+						"--headless",
+						"--norestore",
+						"--convert-to",
+						target_fmt,
+						"--outdir",
+						td,
+						src_path,
+					],
+					check=True,
+					capture_output=True,
+					timeout=25,
+				)
+			except Exception:
+				return None
+			out_path = os.path.join(td, f"image.{target_fmt}")
+			if not os.path.isfile(out_path):
+				return None
+			with open(out_path, "rb") as fh:
+				return fh.read() or None
+
+		svg_bytes = _convert("svg")
+		if not svg_bytes:
+			return None, None
+
+		# LibreOffice always renders EMF/WMF onto a full page canvas (e.g. A4)
+		# regardless of how small the actual drawing is, so the artwork ends up
+		# as a speck inside a mostly-blank SVG. Render the same source to PNG
+		# purely to detect the drawing's real bounding box, then crop the SVG's
+		# viewBox to it - keeps the output fully vector, just windowed tighter.
+		natural_size: Optional[Tuple[int, int]] = None
+		png_bytes = _convert("png")
+		if png_bytes:
+			cropped = _autocrop_bbox(png_bytes)
+			if cropped:
+				(x0, y0, x1, y1), (page_w, page_h) = cropped
+				natural_size = (x1 - x0, y1 - y0)
+				frac_bbox = (x0 / page_w, y0 / page_h, x1 / page_w, y1 / page_h)
+				svg_bytes = _crop_svg_viewbox(svg_bytes, frac_bbox)
+
+		return svg_bytes, natural_size
+
+
+def _encode_image_bytes(
+	img_bytes: bytes, ext: str
+) -> Tuple[str, str, Optional[Tuple[int, int]]]:
+	"""Returns (mime, base64, natural_size_px) for an embedded image, converting
+	EMF/WMF to SVG when possible. natural_size_px is the image's own intrinsic
+	pixel size (read from the file itself), used as a sizing fallback when Word
+	doesn't declare a placement size (wp:extent / VML style) for this drawing."""
+	ext = (ext or "").lower().lstrip(".")
+
+	if ext in _VECTOR_EXT:
+		svg_bytes, natural_size = _convert_vector_image_to_svg(img_bytes, ext)
+		if svg_bytes:
+			return "image/svg+xml", base64.b64encode(svg_bytes).decode("ascii"), natural_size
+		# LibreOffice unavailable/failed: fall back to the raw metafile so no
+		# data is lost, even though most browsers won't render it inline.
+		fallback_mime = "image/x-emf" if ext == "emf" else "image/x-wmf"
+		return fallback_mime, base64.b64encode(img_bytes).decode("ascii"), None
+
+	mime = _RASTER_EXT_MIME.get(ext) or mimetypes.types_map.get(f".{ext}", "application/octet-stream")
+	natural_size: Optional[Tuple[int, int]] = None
+	try:
+		with Image.open(io.BytesIO(img_bytes)) as im:
+			natural_size = im.size
+	except Exception:
+		natural_size = None
+	return mime, base64.b64encode(img_bytes).decode("ascii"), natural_size
+
+
+def _build_image_by_rid(z: "zipfile.ZipFile") -> Dict[str, Tuple[str, str, Optional[Tuple[int, int]]]]:
+	"""Maps a DOCX relationship id -> (mime, base64, natural_size_px) for every embedded image."""
+	image_by_rid: Dict[str, Tuple[str, str, Optional[Tuple[int, int]]]] = {}
+	try:
+		rels_xml = z.read("word/_rels/document.xml.rels")
+		rels_root = fromstring(rels_xml)
+		for rel in rels_root.findall(".//{*}Relationship"):
+			rid = rel.get("Id")
+			target = rel.get("Target") or ""
+			rtype = rel.get("Type") or ""
+			if not rid or not target:
+				continue
+			if "relationships/image" not in rtype:
+				continue
+			norm = target.lstrip("/")
+			if norm.startswith("../"):
+				norm = norm.replace("../", "")
+			if not norm.startswith("word/"):
+				norm = f"word/{norm}"
+			try:
+				img_bytes = z.read(norm)
+			except Exception:
+				continue
+			ext = (norm.rsplit(".", 1)[-1] or "").lower()
+			image_by_rid[rid] = _encode_image_bytes(img_bytes, ext)
+	except Exception:
+		return {}
+	return image_by_rid
+
+
+# Word lets an image be inserted at any size, but rendering it at
+# "max-width:100%" blows it up to the full width of whatever container holds
+# it (an answer cell, a modal, ...), which in turn inflates the surrounding
+# table row. Cap the rendered size and, where Word tells us the size the
+# author actually placed the image at (wp:extent / VML style), honor that
+# instead of always stretching to fill the container.
+MAX_IMG_WIDTH_PX = 220
+MAX_IMG_HEIGHT_PX = 220
+_EMU_PER_PX = 9525  # 914400 EMU per inch / 96 px per inch
+
+
+def _emu_to_px(value) -> Optional[int]:
+	try:
+		px = round(int(value) / _EMU_PER_PX)
+		return px if px > 0 else None
+	except Exception:
+		return None
+
+
+def _pt_to_px(value: float) -> int:
+	return max(1, round(value * 96 / 72))
+
+
+def _drawing_extent_px(node: etree._Element) -> Optional[Tuple[int, int]]:
+	"""Looks up the ancestor w:drawing's declared width/height (wp:extent, in EMUs)."""
+	anc = node.getparent()
+	while anc is not None and etree.QName(anc).localname != "drawing":
+		anc = anc.getparent()
+	if anc is None:
+		return None
+	for child in anc.iter():
+		if etree.QName(child).localname == "extent":
+			w, h = _emu_to_px(child.get("cx")), _emu_to_px(child.get("cy"))
+			if w and h:
+				return w, h
+	return None
+
+
+def _vml_shape_size_px(node: etree._Element) -> Optional[Tuple[int, int]]:
+	"""Looks up the parent v:shape's inline `style="width:..pt;height:..pt"`."""
+	shape = node.getparent()
+	style = (shape.get("style") if shape is not None else None) or ""
+	w_match = re.search(r"width:\s*([\d.]+)pt", style)
+	h_match = re.search(r"height:\s*([\d.]+)pt", style)
+	if w_match and h_match:
+		return _pt_to_px(float(w_match.group(1))), _pt_to_px(float(h_match.group(1)))
+	return None
+
+
+def _fit_within(w: int, h: int, max_w: int, max_h: int) -> Tuple[int, int]:
+	scale = min(1.0, max_w / w, max_h / h)
+	return max(1, round(w * scale)), max(1, round(h * scale))
+
+
+def _img_tag(mime: str, b64: str, size_px: Optional[Tuple[int, int]]) -> str:
+	if size_px:
+		w, h = _fit_within(size_px[0], size_px[1], MAX_IMG_WIDTH_PX, MAX_IMG_HEIGHT_PX)
+		size_style = f"width:{w}px;height:{h}px;max-width:100%;"
+	else:
+		# `min()` keeps both caps active at once. Declaring `max-width` twice in
+		# one style attribute (e.g. "max-width:420px;...;max-width:100%") isn't
+		# additive - the later declaration silently wins and cancels the first,
+		# which let extent-less images grow to the full container width while
+		# only their height stayed capped.
+		size_style = f"max-width:min({MAX_IMG_WIDTH_PX}px, 100%) !important;max-height:{MAX_IMG_HEIGHT_PX}px !important;"
+	return (
+		f'<img src="data:{mime};base64,{b64}" alt="image" '
+		f'style="{size_style}object-fit:contain;display:block;margin:0.5em 0;" />'
+	)
 
 
 def _is_filled(text_or_html: str) -> bool:
@@ -113,8 +383,10 @@ def omml_to_latex(el: etree._Element) -> str:
 		return "".join(omml_to_latex(c) for c in el)
 
 	if name == "f":
-		num = _first_child(_first_child(el, "num") or el, "e")
-		den = _first_child(_first_child(el, "den") or el, "e")
+		num_wrap = _first_child(el, "num")
+		den_wrap = _first_child(el, "den")
+		num = _first_child(num_wrap if num_wrap is not None else el, "e")
+		den = _first_child(den_wrap if den_wrap is not None else el, "e")
 		num_latex = _clean_latex(omml_to_latex(num) if num is not None else "")
 		den_latex = _clean_latex(omml_to_latex(den) if den is not None else "")
 		if not num_latex and not den_latex:
@@ -225,7 +497,7 @@ class ParsedQuestion:
 	points: int
 
 
-def _walk_tc_to_html(tc: etree._Element, image_by_rid: Optional[dict] = None) -> str:
+def _walk_node_to_html(tc: etree._Element, image_by_rid: Optional[dict] = None) -> str:
 	"""Extract cell contents (text + equations) into safe inline HTML.
 
 	We output escaped text + `<br/>` + `$...$` LaTeX blocks. Frontend later turns LaTeX into SVG.
@@ -244,11 +516,11 @@ def _walk_tc_to_html(tc: etree._Element, image_by_rid: Optional[dict] = None) ->
 				if rid in seen_image_rids:
 					return
 				seen_image_rids.add(rid)
-				mime, b64 = image_by_rid[rid]
-				parts.append(
-					f'<img src="data:{mime};base64,{b64}" alt="image" '
-					'style="max-width: 100%; height: auto; display: block; margin: 0.5em 0;" />'
-				)
+				mime, b64, natural_size = image_by_rid[rid]
+				# Prefer the size Word says the author placed the drawing at; if
+				# that's missing, fall back to the image's own intrinsic size
+				# rather than an arbitrary generic box.
+				parts.append(_img_tag(mime, b64, _drawing_extent_px(node) or natural_size))
 				return
 
 		# Older Word exports can embed images via VML:
@@ -259,11 +531,8 @@ def _walk_tc_to_html(tc: etree._Element, image_by_rid: Optional[dict] = None) ->
 				if rid in seen_image_rids:
 					return
 				seen_image_rids.add(rid)
-				mime, b64 = image_by_rid[rid]
-				parts.append(
-					f'<img src="data:{mime};base64,{b64}" alt="image" '
-					'style="max-width: 100%; height: auto; display: block; margin: 0.5em 0;" />'
-				)
+				mime, b64, natural_size = image_by_rid[rid]
+				parts.append(_img_tag(mime, b64, _vml_shape_size_px(node) or natural_size))
 				return
 
 		# Word line breaks
@@ -271,19 +540,46 @@ def _walk_tc_to_html(tc: etree._Element, image_by_rid: Optional[dict] = None) ->
 			parts.append("<br/>")
 			return
 
+		# Runs formatted with Word's Subscript/Superscript button (w:rPr/w:vertAlign)
+		# rather than the Equation Editor - common for chemical formulas like C2H5COOH
+		# typed as plain text with the "2" set to subscript. Without this, the
+		# vertAlign is silently dropped and the formula collapses to flat text.
+		if ns == W_NS and ln == "r":
+			rpr = _first_child(node, "rPr")
+			vert_align = None
+			if rpr is not None:
+				va = _first_child(rpr, "vertAlign")
+				if va is not None:
+					vert_align = va.get(f"{{{W_NS}}}val") or va.get("val")
+			if vert_align in ("subscript", "superscript"):
+				start = len(parts)
+				for child in list(node):
+					walk(child)
+				inner = "".join(parts[start:])
+				del parts[start:]
+				if inner:
+					tag = "sub" if vert_align == "subscript" else "sup"
+					parts.append(f"<{tag}>{inner}</{tag}>")
+				return
+
 		# Word text
 		if ns == W_NS and ln == "t":
 			if node.text:
 				parts.append(_escape_html(node.text))
 			return
 
-		# Word equations (OMML)
+		# Word equations (OMML). oMathPara is Word's own "display equation on its
+		# own line" wrapper (typically a bigger fraction/sum/matrix meant to be
+		# shown large); a bare oMath sits inline inside running text. Emitting
+		# both as inline `$...$` forces the frontend to squeeze a potentially
+		# tall equation into a single text line's height, which is what mangles
+		# them - so keep the distinction and use `$$...$$` for oMathPara.
 		if ns == M_NS and ln in {"oMath", "oMathPara"}:
 			latex = omml_to_latex(node)
 			latex = (latex or "").strip()
 			latex = latex.replace("$", "")
 			if latex:
-				parts.append(f"${latex}$")
+				parts.append(f"$${latex}$$" if ln == "oMathPara" else f"${latex}$")
 			return
 
 		for child in list(node):
@@ -320,7 +616,7 @@ def _extract_docx_table_rows(tbl: etree._Element, image_by_rid: Optional[dict] =
 		out_row: List[str] = []
 		col = 0
 		for tc in tr.findall("w:tc", namespaces=NS):
-			html = _walk_tc_to_html(tc, image_by_rid=image_by_rid)
+			html = _walk_node_to_html(tc, image_by_rid=image_by_rid)
 
 			# vertical merge support (simple carry-down)
 			vmerge = tc.find("w:tcPr/w:vMerge", namespaces=NS)
@@ -364,36 +660,7 @@ def parse_docx_questions(file_bytes: bytes) -> Tuple[List[ParsedQuestion], List[
 
 	with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
 		xml = z.read("word/document.xml")
-		# Build relationship map to resolve embedded images
-		image_by_rid = {}
-		try:
-			rels_xml = z.read("word/_rels/document.xml.rels")
-			rels_root = fromstring(rels_xml)
-			for rel in rels_root.findall(".//{*}Relationship"):
-				rid = rel.get("Id")
-				target = rel.get("Target") or ""
-				rtype = rel.get("Type") or ""
-				if not rid or not target:
-					continue
-				# Only handle images
-				if "relationships/image" not in rtype:
-					continue
-				# Normalize path to zip member
-				norm = target.lstrip("/")
-				if norm.startswith("../"):
-					norm = norm.replace("../", "")
-				if not norm.startswith("word/"):
-					norm = f"word/{norm}"
-				try:
-					img_bytes = z.read(norm)
-					ext = (norm.rsplit(".", 1)[-1] or "").lower()
-					mime = mimetypes.types_map.get(f".{ext}", "application/octet-stream")
-					b64 = base64.b64encode(img_bytes).decode("ascii")
-					image_by_rid[rid] = (mime, b64)
-				except Exception:
-					continue
-		except Exception:
-			image_by_rid = {}
+		image_by_rid = _build_image_by_rid(z)
 
 	tables = _extract_docx_tables(xml)
 	if not tables:
@@ -525,6 +792,116 @@ def parse_docx_questions(file_bytes: bytes) -> Tuple[List[ParsedQuestion], List[
 			)
 		)
 
+	return questions, errors
+
+
+WORD_QUESTION_OPTION_RE = re.compile(r"^(\+)?\s*[A-Da-d]\)\s*")
+
+
+def _extract_docx_body_paragraphs(document_xml: bytes) -> List[etree._Element]:
+	root = fromstring(document_xml)
+	body = root.find("w:body", namespaces=NS)
+	if body is None:
+		return []
+	return [c for c in body if etree.QName(c).localname == "p"]
+
+
+def parse_docx_word_questions(file_bytes: bytes) -> Tuple[List[dict], List[str]]:
+	"""Parse a DOCX using the plain-text convention:
+
+		#Savol matni
+		A) variant
+		+C) to'g'ri variant
+		D) variant
+
+	- A question starts on a paragraph beginning with '#'.
+	- Each option paragraph starts with a letter A-D followed by ')'.
+	- The correct option's letter is prefixed with '+' (e.g. "+C)").
+	- Anything else (extra paragraphs, embedded images) is attached to whatever
+	  is currently open: the question text if no option has started yet,
+	  otherwise the most recently seen option.
+
+	Reuses the same lxml-based HTML walker as the table importer, so embedded
+	images (converted EMF/WMF -> SVG where possible) and Word equations (OMML
+	-> `$...$` LaTeX) are handled identically here.
+	"""
+	questions: List[dict] = []
+	errors: List[str] = []
+	current: Optional[dict] = None
+	q_number = 0
+
+	def flush():
+		nonlocal current, q_number
+		if current is None:
+			return
+		q_number += 1
+		draft = current
+		current = None
+
+		html = draft["html"].strip()
+		plain = _strip_tags(html)
+		has_image = bool(re.search(r"<\s*img\b", html, flags=re.I))
+		if not plain and not has_image:
+			errors.append(f"{q_number}-savol: matni bo'sh")
+			return
+
+		if len(draft["options"]) < 2:
+			errors.append(f"{q_number}-savol: kamida 2 ta variant bo'lishi kerak")
+			return
+
+		correct_index = next((i for i, o in enumerate(draft["options"]) if o["correct"]), -1)
+		if correct_index < 0:
+			errors.append(f"{q_number}-savol: to'g'ri variant ('+') belgilanmagan")
+			return
+
+		questions.append(
+			{
+				"text": html,
+				"type": "multiple_choice",
+				"points": 1,
+				"answers": [
+					{"text": opt["html"].strip(), "isCorrect": i == correct_index, "order": i}
+					for i, opt in enumerate(draft["options"])
+				],
+			}
+		)
+
+	with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+		xml = z.read("word/document.xml")
+		image_by_rid = _build_image_by_rid(z)
+
+	paragraphs = _extract_docx_body_paragraphs(xml)
+
+	for p in paragraphs:
+		html = _walk_node_to_html(p, image_by_rid=image_by_rid)
+		raw_text = "".join(p.itertext()).strip()
+
+		if not html and not raw_text:
+			continue
+
+		if raw_text.startswith("#"):
+			flush()
+			stripped_html = re.sub(r"^#\s*", "", html, count=1).strip()
+			current = {"html": stripped_html, "options": []}
+			continue
+
+		match = WORD_QUESTION_OPTION_RE.match(raw_text)
+		if match and current is not None:
+			is_correct = raw_text.lstrip().startswith("+")
+			stripped_html = WORD_QUESTION_OPTION_RE.sub("", html, count=1).strip()
+			current["options"].append({"html": stripped_html, "correct": is_correct})
+			continue
+
+		# Stray content (e.g. an image on its own paragraph) belongs to whatever
+		# is currently open: the question text, or the most recent option.
+		if current is not None and html:
+			if not current["options"]:
+				current["html"] = f'{current["html"]}<br/>{html}' if current["html"] else html
+			else:
+				last = current["options"][-1]
+				last["html"] = f'{last["html"]}<br/>{html}' if last["html"] else html
+
+	flush()
 	return questions, errors
 
 
